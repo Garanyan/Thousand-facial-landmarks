@@ -14,6 +14,7 @@ import tqdm
 from torch.nn import functional as fnn
 from torch.utils import data
 from torchvision import transforms
+from torch.optim.lr_scheduler import StepLR
 
 from hack_utils import NUM_PTS, CROP_SIZE
 from hack_utils import ScaleMinSideToSize, CropCenter, TransformByKeys
@@ -29,9 +30,9 @@ def parse_arguments():
     parser.add_argument("--name", "-n", help="Experiment name (for saving checkpoints and submits).",
                         default="baseline")
     parser.add_argument("--data", "-d", help="Path to dir with target images & landmarks.", default=None)
-    parser.add_argument("--batch-size", "-b", default=512, type=int)  # 512 is OK for resnet18 finetune @ 6Gb of VRAM
-    parser.add_argument("--epochs", "-e", default=1, type=int)
-    parser.add_argument("--learning-rate", "-lr", default=1e-3, type=float)
+    parser.add_argument("--batch-size", "-b", default=1024, type=int)  # 512 is OK for resnet18 finetune @ 6Gb of VRAM
+    parser.add_argument("--epochs", "-e", default=5, type=int)
+    parser.add_argument("--learning-rate", "-lr", default=6e-4, type=float)
     parser.add_argument("--gpu", action="store_true")
     return parser.parse_args()
 
@@ -87,6 +88,29 @@ def predict(model, loader, device):
 
     return predictions
 
+def kaggle(args):
+    train_transforms = transforms.Compose([
+        ScaleMinSideToSize((CROP_SIZE, CROP_SIZE)),
+        CropCenter(CROP_SIZE),
+        TransformByKeys(transforms.ToPILImage(), ("image",)),
+        TransformByKeys(transforms.ToTensor(), ("image",)),
+        TransformByKeys(transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]), ("image",)),
+    ])
+    print("Creating model...")
+    device = torch.device("cuda: 0") if args.gpu else torch.device("cpu")
+    model = models.resnet18(pretrained=True)
+    model.fc = nn.Linear(model.fc.in_features, 2 * NUM_PTS, bias=True)
+    model.to(device)
+
+    test_dataset = ThousandLandmarksDataset(os.path.join(args.data, 'test'), train_transforms, split="test")
+    test_dataloader = data.DataLoader(test_dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True,
+                                      shuffle=False, drop_last=False)
+
+    with open(f"{args.name}_best.pth", "rb") as fp:
+        best_state_dict = torch.load(fp, map_location="cpu")
+        model.load_state_dict(best_state_dict)
+    test_predictions = predict(model, test_dataloader, device)
+    create_submission(args.data, test_predictions, f"{args.name}_submit.csv")
 
 def main(args):
     # 1. prepare data & models
@@ -98,31 +122,42 @@ def main(args):
         TransformByKeys(transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]), ("image",)),
     ])
 
-    print("Reading data...")
-    train_dataset = ThousandLandmarksDataset(os.path.join(args.data, 'train'), train_transforms, split="train")
-    train_dataloader = data.DataLoader(train_dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True,
-                                       shuffle=True, drop_last=True)
-    val_dataset = ThousandLandmarksDataset(os.path.join(args.data, 'train'), train_transforms, split="val")
-    val_dataloader = data.DataLoader(val_dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True,
-                                     shuffle=False, drop_last=False)
-
     print("Creating model...")
     device = torch.device("cuda: 0") if args.gpu else torch.device("cpu")
     model = models.resnet18(pretrained=True)
     model.fc = nn.Linear(model.fc.in_features, 2 * NUM_PTS, bias=True)
-    model.to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, amsgrad=True)
+
+    #with open(f"{args.name}_best.pth", "rb") as fp:
+    #    best_state_dict = torch.load(fp, map_location="cpu")
+    #    model.load_state_dict(best_state_dict)
+
+    model.to(device)
+    print("Reading data...")
+    train_dataset = ThousandLandmarksDataset(os.path.join(args.data, 'train'), train_transforms, split="train")
+    train_dataloader = data.DataLoader(train_dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True,
+                                       shuffle=True, drop_last=True)
+    print("Reading val data...")
+    val_dataset = ThousandLandmarksDataset(os.path.join(args.data, 'train'), train_transforms, split="val")
+    val_dataloader = data.DataLoader(val_dataset, batch_size=args.batch_size, num_workers=4, pin_memory=True,
+                                     shuffle=False, drop_last=False)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, amsgrad=True)
+    scheduler = StepLR(optimizer, step_size=4, gamma=0.1)
     loss_fn = fnn.mse_loss
 
     # 2. train & validate
     print("Ready for training...")
     best_val_loss = np.inf
     for epoch in range(args.epochs):
+        print("Train")
         train_loss = train(model, train_dataloader, loss_fn, optimizer, device=device)
+        print("validate")
         val_loss = validate(model, val_dataloader, loss_fn, device=device)
         print("Epoch #{:2}:\ttrain loss: {:5.2}\tval loss: {:5.2}".format(epoch, train_loss, val_loss))
+        scheduler.step()
         if val_loss < best_val_loss:
+            print("save best loss " + str(val_loss))
             best_val_loss = val_loss
             with open(f"{args.name}_best.pth", "wb") as fp:
                 torch.save(model.state_dict(), fp)
@@ -146,4 +181,5 @@ def main(args):
 
 if __name__ == '__main__':
     args = parse_arguments()
+    #sys.exit(kaggle(args))
     sys.exit(main(args))
